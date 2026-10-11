@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sors Taxi</title>
+<title>Ride – 3D map demo</title>
 <!-- Free stack, no API keys: MapLibre GL (3D) + OpenFreeMap tiles + Photon geocoder + OSRM routing -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css">
@@ -66,7 +66,8 @@
         <select id="speed" class="form-select w-auto" aria-label="Simulation speed">
           <option value="1">×1</option><option value="5" selected>×5</option><option value="15">×15</option>
         </select>
-        <button id="go" type="button" class="btn btn-outline-success flex-grow-1">Simulate trip</button>
+        <button id="go" type="button" class="btn btn-outline-success flex-grow-1">Simulate</button>
+        <button id="stopTrip" type="button" class="btn btn-danger flex-grow-1" disabled>Stop</button>
         <button id="realGo" type="button" class="btn btn-success flex-grow-1">Go</button>
       </div>
       <div id="live" class="small fw-semibold text-center mt-2"></div>
@@ -87,6 +88,7 @@ const sug = { from: $('#sug-from'), to: $('#sug-to') };
 const state = { from: null, to: null }, marks = {}, seq = { from: 0, to: 0 };
 let ready = false, mode3d = true, R = null, trip = null, follow = true, car = null;
 let gpsWatchId = null, realTrip = false, realLast = null;
+let realTripStart = null, realTripCurrent = null, realTripStartedAt = 0, realTripDistance = 0;
 const editTimers = {}, markerEditing = { from: false, to: false };
 
 /* ---------- helpers ---------- */
@@ -324,11 +326,11 @@ async function calculate() {
 }
 $('#calc').onclick = calculate;
 
-function showRoute(r) {
+function showRoute(r, allowShort = false) {
   const cum = [0];
   for (let i = 1; i < r.coords.length; i++) cum.push(cum[i - 1] + haversine(r.coords[i - 1], r.coords[i]));
   const total = cum[cum.length - 1];
-  if (total < 30) return msg('Pickup and drop-off are the same place.');
+  if (total < 30 && !allowShort) return msg('Pickup and drop-off are the same place.');
   R = { coords: r.coords, cum, total, duration: Math.max(r.duration, 1) };
   const km = total / 1000, min = R.duration / 60;
   $('#r-dist').textContent = fmtDist(total);
@@ -341,16 +343,41 @@ function showRoute(r) {
   fit(r.coords);
 }
 
+function setDestinationAt(p, label = 'Trip stopped here') {
+  state.to = { lng: p.lng, lat: p.lat, label };
+  inp.to.value = label;
+  sug.to.classList.add('d-none');
+  marks.to = marks.to || pin('to');
+  marks.to.setLngLat([p.lng, p.lat]).addTo(map);
+}
+
+function finishTripSummary(route, endpoint, elapsedSeconds, label) {
+  // Update B to the actual stop position, then calculate the final route, duration and fare.
+  setDestinationAt(endpoint, label);
+  showRoute(route, true);
+  $('#r-time').textContent = fmtTime(Math.max(1, elapsedSeconds));
+  const km = R.total / 1000, minutes = Math.max(1, elapsedSeconds) / 60;
+  $('#r-fare').textContent = FARE.cur + Math.max(FARE.min,
+    FARE.base + FARE.perKm * km + FARE.perMin * minutes).toFixed(2);
+  $('#live').textContent = 'Trip ended · ' + fmtDist(R.total) + ' travelled · ' + fmtTime(elapsedSeconds) +
+    ' · final fare ' + $('#r-fare').textContent;
+  $('#stopTrip').disabled = true;
+}
+
 function drawRoute(coords) {
   if (ready) map.getSource('route').setData(coords.length ? line(coords) : EMPTY);
 }
 
 function resetRoute() {
+  if (trip) stopTrip(false);
   R = null;
-  stopTrip();
   drawRoute([]);
   $('#result').classList.add('d-none');
   $('#live').textContent = '';
+  $('#stopTrip').disabled = true;
+  $('#go').textContent = 'Simulate';
+  $('#go').className = 'btn btn-outline-success flex-grow-1';
+  $('#realGo').disabled = false;
 }
 
 function fit(coords) {
@@ -385,11 +412,12 @@ function carEl() {
 function startTrip() {
   if (!R || realTrip) return;
   const a = pointAt(0).p;
-  trip = { d: 0, v: pace(), last: performance.now(), ui: 0, heading: bearing(a, pointAt(40).p) };
+  trip = { d: 0, v: pace(), last: performance.now(), startedAt: performance.now(), ui: 0, heading: bearing(a, pointAt(40).p) };
   follow = true;
   msg('');
   $('#form').classList.add('d-none');
-  $('#go').textContent = 'Stop simulation'; $('#go').className = 'btn btn-danger flex-grow-1';
+  $('#go').textContent = 'Simulating'; $('#go').className = 'btn btn-danger flex-grow-1';
+  $('#stopTrip').disabled = false;
   $('#realGo').disabled = true;
   car = car || new maplibregl.Marker({ element: carEl(), rotationAlignment: 'map', pitchAlignment: 'map' });
   car.setLngLat(a).setRotation(trip.heading).addTo(map);
@@ -425,19 +453,49 @@ function tick(now) {
   requestAnimationFrame(tick);
 }
 
-function stopTrip(arrived) {
+function stopTrip(arrived = false, manual = false) {
   if (!trip) return;
+  const finishedTrip = trip;
+  const oldRoute = R;
+  const elapsed = Math.max(1, (performance.now() - finishedTrip.startedAt) / 1000);
+  const travelled = arrived ? oldRoute.total : Math.max(0, Math.min(finishedTrip.d, oldRoute.total));
+  const endPoint = pointAt(travelled).p;
+  const end = { lng: endPoint[0], lat: endPoint[1], label: arrived ? 'Destination reached' : 'Trip stopped here' };
+  const { p: _unused, i } = pointAt(travelled);
+  const partialCoords = travelled >= oldRoute.total
+    ? oldRoute.coords.slice()
+    : [...oldRoute.coords.slice(0, i + 1), endPoint];
+  const partialRoute = {
+    coords: partialCoords,
+    duration: Math.max(1, oldRoute.duration * (travelled / oldRoute.total)),
+    road: oldRoute.road
+  };
   trip = null;
-  car.remove();
+  car?.remove();
   map.setPadding({ top: 0, right: 0, bottom: 0, left: 0 });
   $('#form').classList.remove('d-none');
   $('#recenter').classList.add('d-none');
-  $('#go').textContent = 'Simulate trip'; $('#go').className = 'btn btn-outline-success flex-grow-1';
+  $('#go').textContent = 'Simulate'; $('#go').className = 'btn btn-outline-success flex-grow-1';
+  $('#stopTrip').disabled = true;
   $('#realGo').disabled = false;
-  $('#live').textContent = arrived ? '✅ Simulation arrived' : '';
-  if (R) { drawRoute(R.coords); fit(R.coords); }
+  if (arrived) {
+    // Normal completion keeps the original destination and full-trip summary.
+    $('#live').textContent = '✅ Arrived · ' + fmtDist(oldRoute.total) + ' · ' + fmtTime(elapsed);
+    drawRoute(oldRoute.coords);
+    if (R) fit(oldRoute.coords);
+  } else {
+    finishTripSummary(partialRoute, end, elapsed, 'Trip stopped here');
+  }
 }
 
+function stopActiveTrip() {
+  if (trip) {
+    stopTrip(false, true);
+    return;
+  }
+  if (realTrip) stopRealTrip(true);
+}
+$('#stopTrip').onclick = stopActiveTrip;
 $('#go').onclick = () => trip ? stopTrip() : startTrip();
 $('#speed').onchange = () => { if (trip && !realTrip) trip.v = pace(); };
 
@@ -497,6 +555,10 @@ function startRealTrip() {
       }
       realTrip = true;
       realLast = [p.lng, p.lat];
+      realTripStart = { lng: p.lng, lat: p.lat, label: 'Trip start' };
+      realTripCurrent = { lng: p.lng, lat: p.lat, label: 'Current location' };
+      realTripStartedAt = Date.now();
+      realTripDistance = 0;
       setPoint('from', p);
       if (!destination) {
         stopRealTrip();
@@ -511,9 +573,10 @@ function startRealTrip() {
         return;
       }
       $('#form').classList.add('d-none');
-      $('#realGo').textContent = 'Stop live trip';
-      $('#realGo').className = 'btn btn-danger flex-grow-1';
-      $('#go').disabled = true;
+      $('#realGo').textContent = 'Go';
+      $('#realGo').className = 'btn btn-success flex-grow-1';
+      $('#realGo').disabled = true;
+      $('#stopTrip').disabled = false;
       $('#live').textContent = '📍 Waiting for live GPS updates…';
       car = car || new maplibregl.Marker({ element: carEl(), rotationAlignment: 'map', pitchAlignment: 'map' });
       car.setLngLat([p.lng, p.lat]).addTo(map);
@@ -521,14 +584,11 @@ function startRealTrip() {
     } else {
       const current = [p.lng, p.lat];
       if (realLast && haversine(realLast, current) > 2) {
+        realTripDistance += haversine(realLast, current);
         car?.setRotation(bearing(realLast, current));
       }
       realLast = current;
-      if (state.from) {
-        state.from = { ...p, label: 'My current location' };
-        marks.from?.setLngLat(current);
-        inp.from.value = state.from.label;
-      }
+      realTripCurrent = { lng: current[0], lat: current[1], label: 'Trip stopped here' };
       car?.setLngLat(current);
       if (follow) map.easeTo({ center: current, duration: 500 });
       if (state.to) {
@@ -541,9 +601,10 @@ function startRealTrip() {
     msg(error);
   });
 }
-function stopRealTrip() {
+async function stopRealTrip(manual = false) {
   if (gpsWatchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(gpsWatchId);
   gpsWatchId = null;
+  const wasActive = realTrip;
   realTrip = false;
   realLast = null;
   car?.remove();
@@ -553,10 +614,35 @@ function stopRealTrip() {
   $('#realGo').className = 'btn btn-success flex-grow-1';
   $('#realGo').disabled = false;
   $('#go').disabled = false;
-  $('#live').textContent = '';
-  if (R) fit(R.coords);
+  $('#stopTrip').disabled = true;
+
+  if (manual && wasActive && realTripStart && realTripCurrent) {
+    const elapsed = Math.max(1, (Date.now() - realTripStartedAt) / 1000);
+    const endpoint = realTripCurrent;
+    // Set B to the live GPS position where Stop was pressed, then get the final road route.
+    setDestinationAt(endpoint, 'Trip stopped here');
+    try {
+      const finalRoute = await getRoute(realTripStart, endpoint);
+      finishTripSummary(finalRoute, endpoint, elapsed, 'Trip stopped here');
+    } catch (e) {
+      const fallback = {
+        coords: [[realTripStart.lng, realTripStart.lat], [endpoint.lng, endpoint.lat]],
+        duration: elapsed,
+        road: false
+      };
+      finishTripSummary(fallback, endpoint, elapsed, 'Trip stopped here');
+      msg('Trip stopped. Road routing was unavailable; final distance uses a straight-line fallback.');
+    }
+  } else {
+    $('#live').textContent = '';
+    if (R) fit(R.coords);
+  }
+  realTripStart = null;
+  realTripCurrent = null;
+  realTripStartedAt = 0;
+  realTripDistance = 0;
 }
-$('#realGo').onclick = () => realTrip ? stopRealTrip() : startRealTrip();
+$('#realGo').onclick = () => { if (!realTrip) startRealTrip(); };
 $('#recenter').onclick = () => { follow = true; $('#recenter').classList.add('d-none'); };
 map.on('movestart', e => {                  // user grabbed the map -> stop chasing, offer a way back
   if (trip && e.originalEvent) { follow = false; $('#recenter').classList.remove('d-none'); }
