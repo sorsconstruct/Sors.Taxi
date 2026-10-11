@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ride – 3D map demo</title>
+<!-- Free stack, no API keys: MapLibre GL (3D) + OpenFreeMap tiles + Photon geocoder + OSRM routing -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+<style>
+  html, body { height: 100%; margin: 0; }
+  #map { position: absolute; inset: 0; }
+  #panel { position: absolute; top: 12px; left: 12px; width: min(400px, calc(100% - 24px)); z-index: 10; border-radius: 16px; }
+  .sug { top: 100%; z-index: 20; max-height: 220px; overflow-y: auto; }
+  .pin { width: 30px; height: 30px; display: grid; place-items: center; background: #000; color: #fff;
+         font: 700 13px system-ui; border: 3px solid #fff; box-shadow: 0 2px 8px rgba(0,0,0,.45); }
+  .pin.a { border-radius: 50%; }
+  .pin.b { border-radius: 6px; }
+  .pin.editing { background: #087f5b; cursor: grab; box-shadow: 0 0 0 5px rgba(8,127,91,.25), 0 2px 8px rgba(0,0,0,.45); }
+  .pin.editing:active { cursor: grabbing; }
+  #recenter { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); z-index: 10; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel" class="card shadow border-0">
+  <div class="card-body p-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <span class="fw-bold fs-5">Ride</span>
+      <div class="btn-group btn-group-sm" role="group" aria-label="Map mode">
+        <button id="btn3d" type="button" class="btn btn-outline-dark active">3D</button>
+        <button id="btn2d" type="button" class="btn btn-outline-dark">2D</button>
+      </div>
+    </div>
+
+    <div id="form">
+      <div class="position-relative mb-2">
+        <div class="input-group">
+          <span class="input-group-text bg-dark text-white fw-bold">A</span>
+          <input id="from" class="form-control" placeholder="From address" autocomplete="off" aria-label="From address">
+          <button id="gpsFrom" class="btn btn-outline-dark" type="button" title="Use my current GPS location" aria-label="Use my current GPS location">⌖ GPS</button>
+        </div>
+        <div id="sug-from" class="sug list-group position-absolute w-100 shadow d-none"></div>
+      </div>
+      <div class="position-relative mb-2">
+        <div class="input-group">
+          <span class="input-group-text bg-dark text-white fw-bold">B</span>
+          <input id="to" class="form-control" placeholder="To address" autocomplete="off" aria-label="To address">
+        </div>
+        <div id="sug-to" class="sug list-group position-absolute w-100 shadow d-none"></div>
+      </div>
+      <button id="calc" type="button" class="btn btn-dark w-100">Calculate distance</button>
+    </div>
+
+    <div id="msg" class="alert alert-warning py-2 small mt-2 mb-0 d-none"></div>
+
+    <div id="result" class="mt-3 d-none">
+      <div class="row text-center g-0">
+        <div class="col"><div class="small text-muted">Distance</div><div id="r-dist" class="fw-bold fs-5"></div></div>
+        <div class="col"><div class="small text-muted">Time</div><div id="r-time" class="fw-bold fs-5"></div></div>
+        <div class="col"><div class="small text-muted">Fare</div><div id="r-fare" class="fw-bold fs-5"></div></div>
+      </div>
+      <div id="r-air" class="small text-muted text-center my-2"></div>
+      <div class="d-flex gap-2">
+        <select id="speed" class="form-select w-auto" aria-label="Simulation speed">
+          <option value="1">×1</option><option value="5" selected>×5</option><option value="15">×15</option>
+        </select>
+        <button id="go" type="button" class="btn btn-outline-success flex-grow-1">Simulate trip</button>
+        <button id="realGo" type="button" class="btn btn-success flex-grow-1">Go</button>
+      </div>
+      <div id="live" class="small fw-semibold text-center mt-2"></div>
+    </div>
+  </div>
+</div>
+
+<button id="recenter" type="button" class="btn btn-dark btn-sm shadow d-none">Re-center</button>
+
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<script>
+/* ---------- config & state ---------- */
+const FARE = { cur: '€', base: 1.5, perKm: 0.8, perMin: 0.15, min: 3 };   // tweak to taste
+const EMPTY = { type: 'FeatureCollection', features: [] };
+const $ = s => document.querySelector(s);
+const inp = { from: $('#from'), to: $('#to') };
+const sug = { from: $('#sug-from'), to: $('#sug-to') };
+const state = { from: null, to: null }, marks = {}, seq = { from: 0, to: 0 };
+let ready = false, mode3d = true, R = null, trip = null, follow = true, car = null;
+let gpsWatchId = null, realTrip = false, realLast = null;
+const editTimers = {}, markerEditing = { from: false, to: false };
+
+/* ---------- helpers ---------- */
+const rad = x => x * Math.PI / 180, deg = x => x * 180 / Math.PI;
+const lerp = (a, b, k) => a + (b - a) * k;
+const angle = (a, b, k) => (a + (((b - a + 540) % 360) - 180) * k + 360) % 360;   // lerp along the shortest turn
+const haversine = ([x1, y1], [x2, y2]) => {
+  const h = Math.sin(rad(y2 - y1) / 2) ** 2 + Math.cos(rad(y1)) * Math.cos(rad(y2)) * Math.sin(rad(x2 - x1) / 2) ** 2;
+  return 12742017.6 * Math.asin(Math.sqrt(h));
+};
+const bearing = ([x1, y1], [x2, y2]) => {
+  const dl = rad(x2 - x1), p1 = rad(y1), p2 = rad(y2);
+  return (deg(Math.atan2(Math.sin(dl) * Math.cos(p2),
+    Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl))) + 360) % 360;
+};
+const line = c => ({ type: 'Feature', geometry: { type: 'LineString', coordinates: c } });
+const fmtDist = m => m < 1000 ? Math.round(m) + ' m' : (m / 1000).toFixed(1) + ' km';
+const fmtTime = s => { const m = Math.max(1, Math.round(s / 60)); return m < 60 ? m + ' min' : Math.floor(m / 60) + ' h ' + (m % 60) + ' min'; };
+const msg = t => { $('#msg').textContent = t; $('#msg').classList.toggle('d-none', !t); };
+const debounce = (fn, ms) => { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; };
+
+/* ---------- map (MapLibre GL + OpenFreeMap, 3D buildings) ---------- */
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.openfreemap.org/styles/liberty',
+  center: [23.3219, 42.6977], zoom: 15.5, pitch: 60, bearing: -20, maxPitch: 80
+});
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+const geo = new maplibregl.GeolocateControl({ positionOptions: { enableHighAccuracy: true } });
+map.addControl(geo, 'bottom-right');
+geo.once('geolocate', e => {   // first GPS fix fills the pickup field
+  if (!state.from) setPoint('from', { lng: e.coords.longitude, lat: e.coords.latitude, label: 'My location' });
+});
+
+map.on('load', () => {
+  const { layers, sources } = map.getStyle();
+  const above = (layers.find(l => l.type === 'symbol' && l.layout && l.layout['text-field']) || {}).id;  // keep labels on top
+  const ext = layers.find(l => l.type === 'fill-extrusion');
+  const src = Object.keys(sources).find(k => sources[k].type === 'vector');
+  if (!ext) map.addLayer({
+    id: 'buildings-3d', type: 'fill-extrusion', source: src, 'source-layer': 'building', minzoom: 14,
+    paint: {
+      'fill-extrusion-color': '#d8d8d8', 'fill-extrusion-opacity': 0.85,
+      'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8],
+      'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0]
+    }
+  }, above);
+  // the style's flat buildings stop at zoom 14, so 2D mode needs its own flat layer
+  map.addLayer({
+    id: 'buildings-2d', type: 'fill', source: src, 'source-layer': 'building', minzoom: 14,
+    layout: { visibility: 'none' }, paint: { 'fill-color': '#e4e0da', 'fill-outline-color': '#c8c2b9' }
+  }, ext ? ext.id : 'buildings-3d');
+
+  map.addSource('route', { type: 'geojson', data: EMPTY });
+  const width = (a, b) => ['interpolate', ['linear'], ['zoom'], 10, a, 18, b];
+  [['route-casing', '#fff', width(5, 16)], ['route-line', '#000', width(3, 9)]].forEach(([id, color, w]) =>
+    map.addLayer({ id, type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
+                   paint: { 'line-color': color, 'line-width': w } }, above));
+  ready = true;
+  setBuildings(mode3d);
+  if (R) drawRoute(R.coords);   // route was calculated before the style finished loading
+});
+
+function setBuildings(on) {
+  if (!ready) return;
+  map.getStyle().layers.filter(l => l.type === 'fill-extrusion')
+    .forEach(l => map.setLayoutProperty(l.id, 'visibility', on ? 'visible' : 'none'));
+  map.setLayoutProperty('buildings-2d', 'visibility', on ? 'none' : 'visible');
+}
+
+/* ---------- 3D / 2D toggle ---------- */
+function setMode(is3d) {
+  mode3d = is3d;
+  $('#btn3d').classList.toggle('active', is3d);
+  $('#btn2d').classList.toggle('active', !is3d);
+  setBuildings(is3d);
+  map.dragRotate[is3d ? 'enable' : 'disable']();
+  map.touchPitch[is3d ? 'enable' : 'disable']();
+  map.touchZoomRotate[is3d ? 'enableRotation' : 'disableRotation']();
+  if (!trip) map.easeTo({ pitch: is3d ? 60 : 0, bearing: is3d ? map.getBearing() : 0, duration: 800 });
+}
+$('#btn3d').onclick = () => setMode(true);
+$('#btn2d').onclick = () => setMode(false);
+
+/* ---------- address search (Photon autocomplete, Nominatim fallback on submit) ---------- */
+const label = p => [...new Set([p.name, [p.street, p.housenumber].filter(Boolean).join(' '), p.city || p.county, p.country]
+  .filter(Boolean))].join(', ') || 'Selected place';
+
+async function search(q, final) {
+  const c = map.getCenter();
+  try {
+    const r = await fetch(`https://photon.komoot.io/api/?limit=5&lat=${c.lat}&lon=${c.lng}&q=${encodeURIComponent(q)}`);
+    if (!r.ok) throw new Error('Photon ' + r.status);
+    const hits = (await r.json()).features.map(f =>
+      ({ lng: f.geometry.coordinates[0], lat: f.geometry.coordinates[1], label: label(f.properties) }));
+    if (hits.length || !final) return hits;
+  } catch (e) { if (!final) throw e; }
+  // Nominatim forbids autocomplete, so it is only used when the user submits
+  const r = await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=' + encodeURIComponent(q));
+  if (!r.ok) throw new Error('Address search failed. Try again.');
+  return (await r.json()).map(x => ({ lng: +x.lon, lat: +x.lat, label: x.display_name }));
+}
+
+function render(k, items) {
+  sug[k].innerHTML = '';
+  items.forEach(it => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'list-group-item list-group-item-action small text-truncate';
+    b.textContent = it.label;
+    b.addEventListener('click', () => setPoint(k, it));
+    sug[k].appendChild(b);
+  });
+  sug[k].classList.toggle('d-none', !items.length);
+}
+
+async function suggest(k) {
+  const q = inp[k].value.trim(), n = ++seq[k];
+  if (q.length < 3) return sug[k].classList.add('d-none');
+  try { const items = await search(q); if (n === seq[k]) render(k, items); } catch { /* ignore while typing */ }
+}
+
+function pin(k) {
+  const el = document.createElement('div');
+  el.className = 'pin ' + (k === 'from' ? 'a' : 'b');
+  el.textContent = k === 'from' ? 'A' : 'B';
+  el.title = 'Tap and hold for 2 seconds to ' + (k === 'from' ? 'edit pickup' : 'edit destination') + ' location';
+  let holdTimer = null, longPressFired = false, suppressClickUntil = 0;
+  const marker = new maplibregl.Marker({ element: el, draggable: false });
+
+  // A long press toggles precise map-position editing. The map itself is not moved.
+  el.addEventListener('pointerdown', e => {
+    if (e.button !== undefined && e.button !== 0) return;
+    longPressFired = false;
+    clearTimeout(holdTimer);
+    holdTimer = setTimeout(() => {
+      longPressFired = true;
+      suppressClickUntil = Date.now() + 700;
+      markerEditing[k] = !markerEditing[k];
+      marker.setDraggable(markerEditing[k]);
+      el.classList.toggle('editing', markerEditing[k]);
+      el.title = markerEditing[k]
+        ? 'Drag to position ' + (k === 'from' ? 'A' : 'B') + '; tap and hold 2 seconds to finish'
+        : 'Tap and hold for 2 seconds to edit location';
+      msg(markerEditing[k]
+        ? 'Location editing enabled for point ' + (k === 'from' ? 'A' : 'B') + '. Drag the pin to the precise place.'
+        : 'Location editing finished.');
+      e.preventDefault();
+    }, 2000);
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(type =>
+    el.addEventListener(type, () => clearTimeout(holdTimer)));
+  el.addEventListener('click', e => {
+    if (longPressFired || Date.now() < suppressClickUntil) { e.preventDefault(); e.stopPropagation(); longPressFired = false; }
+  });
+  marker.on('dragstart', () => { map.stop(); });
+  marker.on('dragend', async () => {
+    const pos = marker.getLngLat();
+    const previousLabel = state[k]?.label || '';
+    state[k] = { lng: pos.lng, lat: pos.lat, label: previousLabel };
+    resetRoute();
+    try {
+      const r = await fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=' +
+        encodeURIComponent(pos.lat) + '&lon=' + encodeURIComponent(pos.lng));
+      if (r.ok) {
+        const j = await r.json();
+        state[k].label = j.display_name || (pos.lat.toFixed(6) + ', ' + pos.lng.toFixed(6));
+      } else {
+        state[k].label = pos.lat.toFixed(6) + ', ' + pos.lng.toFixed(6);
+      }
+    } catch {
+      state[k].label = pos.lat.toFixed(6) + ', ' + pos.lng.toFixed(6);
+    }
+    inp[k].value = state[k].label;
+    msg('Point ' + (k === 'from' ? 'A' : 'B') + ' updated to ' +
+      pos.lat.toFixed(6) + ', ' + pos.lng.toFixed(6) + '. Calculate distance again.');
+  });
+  return marker;
+}
+
+function setPoint(k, p) {
+  seq[k]++;
+  state[k] = p;
+  inp[k].value = p.label;
+  sug[k].classList.add('d-none');
+  marks[k] = marks[k] || pin(k);
+  marks[k].setLngLat([p.lng, p.lat]).addTo(map);
+  resetRoute();
+  if (state.from && state.to) fit([[state.from.lng, state.from.lat], [state.to.lng, state.to.lat]]);
+  else map.flyTo({ center: [p.lng, p.lat], zoom: 16, pitch: mode3d ? 60 : 0 });
+}
+
+async function resolve(k) {
+  const q = inp[k].value.trim();
+  if (!q) { inp[k].focus(); throw new Error(k === 'from' ? 'Enter the From address.' : 'Enter the To address.'); }
+  if (state[k] && state[k].label === q) return state[k];
+  const [hit] = await search(q, true);
+  if (!hit) throw new Error('Address not found: ' + q);
+  setPoint(k, hit);
+  return hit;
+}
+
+['from', 'to'].forEach(k => {
+  const soon = debounce(() => suggest(k), 400);
+  inp[k].addEventListener('input', () => { if (R) resetRoute(); soon(); });
+  inp[k].addEventListener('keydown', e => { if (e.key === 'Enter') calculate(); });
+  inp[k].addEventListener('blur', () => sug[k].classList.add('d-none'));
+  sug[k].addEventListener('mousedown', e => e.preventDefault());   // keep input focus so the tap lands as a click (no ghost clicks)
+});
+
+/* ---------- route + distance (OSRM, straight-line fallback) ---------- */
+async function getRoute(a, b) {
+  const path = `/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`;
+  for (const host of ['https://router.project-osrm.org', 'https://routing.openstreetmap.de/routed-car']) {
+    try {
+      const j = await (await fetch(host + path)).json();
+      if (j.code === 'Ok') return { coords: j.routes[0].geometry.coordinates, duration: j.routes[0].duration, road: true };
+    } catch { /* try the next server */ }
+  }
+  const d = haversine([a.lng, a.lat], [b.lng, b.lat]);
+  return { coords: [[a.lng, a.lat], [b.lng, b.lat]], duration: d / 13.9, road: false };   // ~50 km/h
+}
+
+async function calculate() {
+  const btn = $('#calc');
+  if (btn.disabled) return;
+  document.activeElement.blur();
+  msg('');
+  btn.disabled = true; btn.textContent = 'Calculating…';
+  try {
+    const a = await resolve('from'), b = await resolve('to');
+    showRoute(await getRoute(a, b));
+  } catch (e) { msg(e.message); }
+  btn.disabled = false; btn.textContent = 'Calculate distance';
+}
+$('#calc').onclick = calculate;
+
+function showRoute(r) {
+  const cum = [0];
+  for (let i = 1; i < r.coords.length; i++) cum.push(cum[i - 1] + haversine(r.coords[i - 1], r.coords[i]));
+  const total = cum[cum.length - 1];
+  if (total < 30) return msg('Pickup and drop-off are the same place.');
+  R = { coords: r.coords, cum, total, duration: Math.max(r.duration, 1) };
+  const km = total / 1000, min = R.duration / 60;
+  $('#r-dist').textContent = fmtDist(total);
+  $('#r-time').textContent = fmtTime(R.duration);
+  $('#r-fare').textContent = FARE.cur + Math.max(FARE.min, FARE.base + FARE.perKm * km + FARE.perMin * min).toFixed(2);
+  $('#r-air').textContent = 'Straight line: ' + fmtDist(haversine([state.from.lng, state.from.lat], [state.to.lng, state.to.lat]));
+  $('#result').classList.remove('d-none');
+  if (!r.road) msg('No road route available – showing the straight-line distance.');
+  drawRoute(r.coords);
+  fit(r.coords);
+}
+
+function drawRoute(coords) {
+  if (ready) map.getSource('route').setData(coords.length ? line(coords) : EMPTY);
+}
+
+function resetRoute() {
+  R = null;
+  stopTrip();
+  drawRoute([]);
+  $('#result').classList.add('d-none');
+  $('#live').textContent = '';
+}
+
+function fit(coords) {
+  const b = new maplibregl.LngLatBounds(coords[0], coords[0]);
+  coords.forEach(c => b.extend(c));
+  const wide = innerWidth >= 768;
+  map.fitBounds(b, {
+    padding: { top: wide ? 70 : $('#panel').offsetHeight + 30, bottom: 70, left: wide ? 450 : 30, right: wide ? 80 : 30 },
+    maxZoom: 16.5, pitch: mode3d ? 45 : 0, duration: 1500
+  });
+}
+
+/* ---------- live navigation: car drives the route, camera follows ---------- */
+function pointAt(d) {                      // position + segment index at distance d (m) along the route
+  const { coords, cum, total } = R;
+  d = Math.max(0, Math.min(d, total));
+  let lo = 0, hi = cum.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= d) lo = m; else hi = m; }
+  const t = (d - cum[lo]) / ((cum[hi] - cum[lo]) || 1);
+  return { i: lo, p: [lerp(coords[lo][0], coords[hi][0], t), lerp(coords[lo][1], coords[hi][1], t)] };
+}
+
+const pace = () => R.total / R.duration * +$('#speed').value;   // m/s, route average x simulation speed
+
+function carEl() {
+  const el = document.createElement('div');
+  el.innerHTML = '<svg width="26" height="44" viewBox="0 0 26 44"><rect x="2" y="2" width="22" height="40" rx="9" fill="#000" stroke="#fff" stroke-width="2.5"/>' +
+    '<rect x="6" y="10" width="14" height="8" rx="2.5" fill="#8cf"/><rect x="6" y="28" width="14" height="6" rx="2.5" fill="#8cf"/></svg>';
+  return el;
+}
+
+function startTrip() {
+  if (!R || realTrip) return;
+  const a = pointAt(0).p;
+  trip = { d: 0, v: pace(), last: performance.now(), ui: 0, heading: bearing(a, pointAt(40).p) };
+  follow = true;
+  msg('');
+  $('#form').classList.add('d-none');
+  $('#go').textContent = 'Stop simulation'; $('#go').className = 'btn btn-danger flex-grow-1';
+  $('#realGo').disabled = true;
+  car = car || new maplibregl.Marker({ element: carEl(), rotationAlignment: 'map', pitchAlignment: 'map' });
+  car.setLngLat(a).setRotation(trip.heading).addTo(map);
+  requestAnimationFrame(tick);
+}
+
+function tick(now) {
+  if (!trip) return;
+  const dt = Math.max(0, Math.min((now - trip.last) / 1000, 0.1));
+  trip.last = now;
+  trip.d = Math.min(trip.d + trip.v * dt, R.total);
+  const { p, i } = pointAt(trip.d), ahead = pointAt(trip.d + 40).p;
+  if (haversine(p, ahead) > 2) trip.heading = angle(trip.heading, bearing(p, ahead), 1 - Math.exp(-dt * 5));
+  car.setLngLat(p).setRotation(trip.heading);
+
+  if (follow) {                             // eased chase camera
+    const k = 1 - Math.exp(-dt * 6), c = map.getCenter();
+    map.jumpTo({
+      center: [lerp(c.lng, p[0], k), lerp(c.lat, p[1], k)],
+      zoom: lerp(map.getZoom(), mode3d ? 17 : 16, k),
+      pitch: lerp(map.getPitch(), mode3d ? 60 : 0, k),
+      bearing: angle(map.getBearing(), mode3d ? trip.heading : 0, k),
+      padding: { top: lerp(map.getPadding().top, innerHeight * 0.3, k), bottom: 0, left: 0, right: 0 }
+    });
+  }
+  if (now - trip.ui > 250) {                // live remaining distance / ETA + shrinking route line
+    trip.ui = now;
+    const left = 1 - trip.d / R.total;
+    $('#live').textContent = '🚗 ' + fmtDist(R.total * left) + ' left · ' + fmtTime(R.duration * left);
+    map.getSource('route').setData(line([p, ...R.coords.slice(i + 1)]));
+  }
+  if (trip.d >= R.total) return stopTrip(true);
+  requestAnimationFrame(tick);
+}
+
+function stopTrip(arrived) {
+  if (!trip) return;
+  trip = null;
+  car.remove();
+  map.setPadding({ top: 0, right: 0, bottom: 0, left: 0 });
+  $('#form').classList.remove('d-none');
+  $('#recenter').classList.add('d-none');
+  $('#go').textContent = 'Simulate trip'; $('#go').className = 'btn btn-outline-success flex-grow-1';
+  $('#realGo').disabled = false;
+  $('#live').textContent = arrived ? '✅ Simulation arrived' : '';
+  if (R) { drawRoute(R.coords); fit(R.coords); }
+}
+
+$('#go').onclick = () => trip ? stopTrip() : startTrip();
+$('#speed').onchange = () => { if (trip && !realTrip) trip.v = pace(); };
+
+// Ask the phone/browser for permission and use its current GPS fix for point A.
+async function reverseLabel(lat, lng) {
+  try {
+    const r = await fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=' +
+      encodeURIComponent(lat) + '&lon=' + encodeURIComponent(lng));
+    if (r.ok) {
+      const j = await r.json();
+      if (j.display_name) return j.display_name;
+    }
+  } catch { /* coordinates remain a valid fallback label */ }
+  return lat.toFixed(6) + ', ' + lng.toFixed(6);
+}
+function requestGPS(onFix, onError) {
+  if (!navigator.geolocation) {
+    onError('GPS location is not supported by this browser.');
+    return null;
+  }
+  return navigator.geolocation.watchPosition(onFix, err => {
+    const reasons = {
+      1: 'Location permission was denied. Allow location access in your browser and try again.',
+      2: 'Your current GPS location is unavailable. Check that Location is enabled on your phone.',
+      3: 'GPS request timed out. Try again in an area with a clearer view of the sky.'
+    };
+    onError(reasons[err.code] || 'Could not read your current GPS location.');
+  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+}
+$('#gpsFrom').onclick = () => {
+  msg('Requesting permission to access your phone location…');
+  let oneShotWatchId = null;
+  oneShotWatchId = requestGPS(async pos => {
+    if (oneShotWatchId !== null) navigator.geolocation.clearWatch(oneShotWatchId);
+    const p = { lng: pos.coords.longitude, lat: pos.coords.latitude, label: 'My location' };
+    p.label = await reverseLabel(p.lat, p.lng);
+    setPoint('from', p);
+    msg('Point A set from your current GPS location.');
+  }, error => {
+    if (oneShotWatchId !== null) navigator.geolocation.clearWatch(oneShotWatchId);
+    msg(error);
+  });
+};
+
+function startRealTrip() {
+  if (gpsWatchId !== null) navigator.geolocation.clearWatch(gpsWatchId);
+  msg('Requesting GPS access to start live trip…');
+  gpsWatchId = requestGPS(async pos => {
+    const p = { lng: pos.coords.longitude, lat: pos.coords.latitude, label: 'My location' };
+    if (!realTrip) {
+      const destination = state.to;
+      if (!destination) {
+        if (gpsWatchId !== null) navigator.geolocation.clearWatch(gpsWatchId);
+        gpsWatchId = null;
+        msg('Enter destination B before starting a live trip.');
+        return;
+      }
+      realTrip = true;
+      realLast = [p.lng, p.lat];
+      setPoint('from', p);
+      if (!destination) {
+        stopRealTrip();
+        msg('Enter destination B before starting a live trip.');
+        return;
+      }
+      try {
+        showRoute(await getRoute(p, destination));
+      } catch (e) {
+        stopRealTrip();
+        msg('Unable to calculate route: ' + e.message);
+        return;
+      }
+      $('#form').classList.add('d-none');
+      $('#realGo').textContent = 'Stop live trip';
+      $('#realGo').className = 'btn btn-danger flex-grow-1';
+      $('#go').disabled = true;
+      $('#live').textContent = '📍 Waiting for live GPS updates…';
+      car = car || new maplibregl.Marker({ element: carEl(), rotationAlignment: 'map', pitchAlignment: 'map' });
+      car.setLngLat([p.lng, p.lat]).addTo(map);
+      follow = true;
+    } else {
+      const current = [p.lng, p.lat];
+      if (realLast && haversine(realLast, current) > 2) {
+        car?.setRotation(bearing(realLast, current));
+      }
+      realLast = current;
+      if (state.from) {
+        state.from = { ...p, label: 'My current location' };
+        marks.from?.setLngLat(current);
+        inp.from.value = state.from.label;
+      }
+      car?.setLngLat(current);
+      if (follow) map.easeTo({ center: current, duration: 500 });
+      if (state.to) {
+        const remaining = haversine(current, [state.to.lng, state.to.lat]);
+        $('#live').textContent = '📍 GPS live · ' + fmtDist(remaining) + ' straight-line distance to B';
+      }
+    }
+  }, error => {
+    if (realTrip) stopRealTrip();
+    msg(error);
+  });
+}
+function stopRealTrip() {
+  if (gpsWatchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(gpsWatchId);
+  gpsWatchId = null;
+  realTrip = false;
+  realLast = null;
+  car?.remove();
+  map.setPadding({ top: 0, right: 0, bottom: 0, left: 0 });
+  $('#form').classList.remove('d-none');
+  $('#realGo').textContent = 'Go';
+  $('#realGo').className = 'btn btn-success flex-grow-1';
+  $('#realGo').disabled = false;
+  $('#go').disabled = false;
+  $('#live').textContent = '';
+  if (R) fit(R.coords);
+}
+$('#realGo').onclick = () => realTrip ? stopRealTrip() : startRealTrip();
+$('#recenter').onclick = () => { follow = true; $('#recenter').classList.add('d-none'); };
+map.on('movestart', e => {                  // user grabbed the map -> stop chasing, offer a way back
+  if (trip && e.originalEvent) { follow = false; $('#recenter').classList.remove('d-none'); }
+});
+</script>
+</body>
+</html>
